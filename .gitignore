@@ -1,0 +1,23 @@
+# Secrets: ignore all env files, keep only the template
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+
+# Testing
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+
+# Editors
+.idea/
+.vscode/
+
+# OS / logs
+*.log
+.DS_Store

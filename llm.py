@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from schemas import build_gemini_tools
+from optimization import Metrics
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ class BaseLLM(ABC):
     """Common interface used by the agent loop."""
 
     @abstractmethod
-    def generate(self, contents: List[Any]) -> LLMResponse:
+    def generate(self, contents: List[Any], metrics: Metrics | None = None) -> LLMResponse:
         """Given the ordered conversation ``contents``, produce the next turn."""
 
 
@@ -106,7 +107,7 @@ class GeminiLLM(BaseLLM):
         self._tools = build_gemini_tools()
         self._retry_delays = retry_delays
 
-    def generate(self, contents: List[Any]) -> LLMResponse:
+    def generate(self, contents: List[Any], metrics: Metrics | None = None) -> LLMResponse:
         """Call Gemini, retrying up to 2 times on transient failures."""
         config = self._build_config()
         last_exc: Exception | None = None
@@ -117,6 +118,12 @@ class GeminiLLM(BaseLLM):
                     contents=list(contents),
                     config=config,
                 )
+                if metrics:
+                    metrics.api_calls += 1
+                    usage = getattr(response, "usage_metadata", None)
+                    if usage:
+                        metrics.optimized_input_tokens = (metrics.optimized_input_tokens or 0) + (getattr(usage, "prompt_token_count", 0) or 0)
+                        metrics.output_tokens = (metrics.output_tokens or 0) + (getattr(usage, "candidates_token_count", 0) or 0)
                 return self._parse_response(response)
             except Exception as exc:  # noqa: BLE001 - classified below
                 if _is_retryable(exc) and attempt < len(self._retry_delays):
@@ -184,25 +191,10 @@ class GeminiLLM(BaseLLM):
 def agent_system_prompt() -> str:
     """System prompt (kept in llm.py so both backends share the wording)."""
     return (
-        "You are an autonomous customer resolution specialist for an online store.\n"
-        "\n"
-        "WORKFLOW (follow it strictly):\n"
-        "1. lookup_order with the customer's order ID.\n"
-        "2. check_inventory with the item_id from the order.\n"
-        "3. Resolution decision:\n"
-        "   - If the order is exchange-eligible AND stock > 0: confirm_exchange.\n"
-        "   - Otherwise (not eligible OR stock == 0 OR the item is unknown):\n"
-        "     process_refund with a short reason.\n"
-        "4. send_notification to the customer's email summarizing the outcome.\n"
-        "5. Reply with a concise, polite final summary.\n"
-        "\n"
-        "RULES:\n"
-        "- If the order is not found, do NOT refund or exchange. Explain that "
-        "the order could not be found and ask the customer to verify the order ID.\n"
-        "- Never invent data. Base every statement on tool results only.\n"
-        "- Decide autonomously. Do not ask the user which tool to use.\n"
-        "- If a tool returns an error, read the error and adapt (e.g. an "
-        "ALREADY_REFUNDED error means you must not refund again).\n"
+        "Resolve damaged-order requests with tools. Lookup order, then inventory. "
+        "Exchange only if eligible and in stock; otherwise refund with a brief reason. "
+        "Notify after a successful resolution, then give a concise summary. "
+        "For missing orders do not mutate: ask for a valid ID. Use only tool facts; adapt to errors."
     )
 
 
@@ -288,7 +280,7 @@ class MockLLM(BaseLLM):
 
     # -- interface ----------------------------------------------------------
 
-    def generate(self, contents: List[Any]) -> LLMResponse:
+    def generate(self, contents: List[Any], metrics: Metrics | None = None) -> LLMResponse:
         user_message, latest = self._extract(contents)
         done = set(latest)
 

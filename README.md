@@ -161,6 +161,36 @@ DB side effects:
 
 ## Design notes
 
+## AI optimization
+
+The agent keeps its existing Gemini/manual-tool architecture while adding four
+measured optimizations: compact instructions and declarations, schema-aware
+payload pruning, ordered parallel execution of independent read-only calls,
+and a bounded 120-second process-local TTL cache. Mutating tools are never
+cached or parallelized. Cache keys include the operation and validated args;
+multi-tenant integrations should also pass a tenant identifier. The in-memory
+cache is per process, so use Redis for multi-instance deployments.
+
+```mermaid
+flowchart LR
+  U[User] --> A[ResolutionAgent]
+  A --> P[Prune/compact request]
+  P --> G[Gemini]
+  G --> E[Safe tool executor]
+  E --> C[TTL cache: reads]
+  E --> D[DB tools]
+  E --> M[Measured metrics]
+```
+
+Configure `.env` with `AI_OPTIMIZATION_ENABLED`, `PROMPT_COMPACTION_ENABLED`,
+`PAYLOAD_PRUNING_ENABLED`, `PARALLEL_TOOL_CALLING`, `CACHE_TTL_SECONDS` (120),
+`CACHE_MAX_ENTRIES`, `MAX_HISTORY_MESSAGES`, and `TOOL_TIMEOUT_MS`.
+
+Run the reproducible offline benchmark with `python benchmark.py`; its tool
+latency is explicitly simulated, while cache counts and payload sizes are
+actual process measurements. Gemini token/output usage appears only when the
+provider returns usage metadata; unavailable values remain `N/A`.
+
 - **Tools are the only mutation point** for the mock DB; every tool returns
   `{"status": "success"|"error", ...}` and never raises, so the loop always
   has an observation to feed back.

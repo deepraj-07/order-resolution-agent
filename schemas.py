@@ -18,19 +18,13 @@ from typing import Any, Dict, List
 
 LOOKUP_ORDER_SCHEMA: Dict[str, Any] = {
     "name": "lookup_order",
-    "description": (
-        "Look up an order by its exact order ID. Returns the customer name "
-        "and email, the ordered item, the price, the order status, whether "
-        "the order is exchange-eligible (with the reason), and the original "
-        "payment method. Always call this first, before any other tool, so "
-        "you know if the order exists and what its eligibility is."
-    ),
+    "description": "Get order facts and exchange eligibility. Call first.",
     "parameters": {
         "type": "object",
         "properties": {
             "order_id": {
                 "type": "string",
-                "description": "Exact order identifier, e.g. 'ORD-1001'.",
+                "description": "Order ID.",
             },
         },
         "required": ["order_id"],
@@ -39,17 +33,13 @@ LOOKUP_ORDER_SCHEMA: Dict[str, Any] = {
 
 CHECK_INVENTORY_SCHEMA: Dict[str, Any] = {
     "name": "check_inventory",
-    "description": (
-        "Check the warehouse stock for an item ID. Returns the stock count "
-        "and whether a replacement unit is available. Call this after "
-        "lookup_order using the item_id from the order record."
-    ),
+    "description": "Get replacement stock for an item.",
     "parameters": {
         "type": "object",
         "properties": {
             "item_id": {
                 "type": "string",
-                "description": "Exact item identifier from the order record, e.g. 'ITEM-LAPTOP-15'.",
+                "description": "Item ID.",
             },
         },
         "required": ["item_id"],
@@ -58,13 +48,7 @@ CHECK_INVENTORY_SCHEMA: Dict[str, Any] = {
 
 PROCESS_REFUND_SCHEMA: Dict[str, Any] = {
     "name": "process_refund",
-    "description": (
-        "Issue a financial refund to the customer's original payment method. "
-        "Use ONLY when a replacement is unavailable (stock is 0) or the order "
-        "is not eligible for exchange. Never use when the exchange is "
-        "possible. Never refund an order you have not looked up, and never "
-        "refund twice."
-    ),
+    "description": "Refund after lookup when exchange is impossible.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -83,11 +67,7 @@ PROCESS_REFUND_SCHEMA: Dict[str, Any] = {
 
 CONFIRM_EXCHANGE_SCHEMA: Dict[str, Any] = {
     "name": "confirm_exchange",
-    "description": (
-        "Confirm a replacement shipment. Use ONLY when the order is "
-        "exchange-eligible AND stock > 0. Decrement the item stock by one "
-        "and lock in the replacement."
-    ),
+    "description": "Confirm an eligible, in-stock replacement.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -102,12 +82,7 @@ CONFIRM_EXCHANGE_SCHEMA: Dict[str, Any] = {
 
 SEND_NOTIFICATION_SCHEMA: Dict[str, Any] = {
     "name": "send_notification",
-    "description": (
-        "Send a confirmation notification to the customer by email. Use the "
-        "customer_email from lookup_order. Wrap up every successful "
-        "resolution (refund or exchange) with exactly one polite "
-        "notification describing what was done."
-    ),
+    "description": "Email the completed resolution.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -141,7 +116,7 @@ SCHEMAS_BY_NAME: Dict[str, Dict[str, Any]] = {schema["name"]: schema for schema 
 # Gemini conversion
 # ---------------------------------------------------------------------------
 
-def build_gemini_tools() -> List[Any]:
+def build_gemini_tools(names: List[str] | None = None) -> List[Any]:
     """Convert the dict schemas into ``google.genai.types.Tool`` declarations.
 
     The google-genai SDK is imported lazily so the offline MockLLM path keeps
@@ -151,6 +126,8 @@ def build_gemini_tools() -> List[Any]:
 
     declarations = []
     for schema in TOOL_SCHEMAS:
+        if names is not None and schema["name"] not in names:
+            continue
         properties = {
             prop_name: types.Schema(
                 type=getattr(types.Type, prop_def["type"].upper()),

@@ -16,6 +16,7 @@ import argparse
 import logging
 import os
 import sys
+import json
 
 from dotenv import load_dotenv
 
@@ -108,6 +109,7 @@ def run_demo(llm: BaseLLM, max_iterations: int) -> None:
         print(f"Escalated    : {result.escalated}")
         print(f"Model calls  : {result.iterations}")
         print(f"Tools called : {' -> '.join(result.tools_called) or '(none)'}")
+        print("Optimization metrics:", json.dumps(result.metrics, default=str))
         print(_side_effects())
 
 
@@ -130,6 +132,7 @@ def run_interactive(llm: BaseLLM, max_iterations: int) -> None:
         result = agent.run(message)
         print(f"\n{result.final_answer}")
         print(f"(tools: {', '.join(result.tools_called) or 'none'})")
+        print("(optimization:", json.dumps(result.metrics, default=str), ")")
         print(_side_effects())
 
 

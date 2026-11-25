@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict
 
 from schemas import SCHEMAS_BY_NAME
 import tools
+from optimization import CACHE, CONFIG, Metrics
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,10 @@ def _validate_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any] | Non
     return None
 
 
-def dispatch(tool_name: str, raw_args: Any) -> Dict[str, Any]:
+READ_ONLY_TOOLS = {"lookup_order", "check_inventory"}
+
+
+def dispatch(tool_name: str, raw_args: Any, metrics: Metrics | None = None) -> Dict[str, Any]:
     """Safely execute a whitelisted tool. Never raises.
 
     ``raw_args`` may be a dict (as returned by Gemini) or a JSON string
@@ -129,7 +133,16 @@ def dispatch(tool_name: str, raw_args: Any) -> Dict[str, Any]:
         return validation
 
     try:
-        output = TOOL_REGISTRY[tool_name](**args)
+        # Only idempotent read tools are cached. Mutations deliberately bypass
+        # the cache and invalidate it in the agent after a successful write.
+        if CONFIG.enabled and tool_name in READ_ONLY_TOOLS:
+            started = __import__("time").perf_counter()
+            output = CACHE.get_or_load(CACHE.key(tool_name, args), lambda: TOOL_REGISTRY[tool_name](**args), metrics)
+            elapsed = (__import__("time").perf_counter() - started) * 1000
+            if metrics:
+                (metrics.cache_latency_ms if metrics.cache_hits else metrics.uncached_latency_ms).append(elapsed)
+        else:
+            output = TOOL_REGISTRY[tool_name](**args)
     except Exception as exc:  # noqa: BLE001 - the loop must never crash
         logger.exception("Tool '%s' raised while executing", tool_name)
         return _error(

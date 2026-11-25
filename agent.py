@@ -17,6 +17,8 @@ self-correction via the dispatcher, and retry/escalation around LLM failures.
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -24,6 +26,7 @@ from google.genai import types
 
 from llm import BaseLLM, LLMUnavailableError
 from registry import dispatch
+from optimization import CONFIG, Metrics, json_size, prune
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,7 @@ class AgentResult:
     escalated: bool
     iterations: int  # number of model calls actually made
     trace: List[Dict[str, Any]] = field(default_factory=list)
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def tools_called(self) -> List[str]:
@@ -70,6 +74,7 @@ class ResolutionAgent:
 
     def run(self, user_message: str) -> AgentResult:
         """Run the full ReAct loop for one customer message."""
+        metrics = Metrics()
         contents: List[Any] = [
             types.Content(role="user", parts=[types.Part(text=user_message)])
         ]
@@ -77,7 +82,10 @@ class ResolutionAgent:
 
         for iteration in range(1, self.max_iterations + 1):
             try:
-                response = self.llm.generate(contents)
+                payload = {"contents": [str(c) for c in contents]}
+                metrics.original_payload_bytes += json_size(payload)
+                metrics.optimized_payload_bytes += json_size(prune(payload))
+                response = self.llm.generate(contents, metrics=metrics)
             except LLMUnavailableError as exc:
                 logger.exception("LLM backend unavailable")
                 trace.append(
@@ -88,17 +96,28 @@ class ResolutionAgent:
                         "observation": [],
                     }
                 )
-                return self._escalate(trace, iteration, reason=f"llm_error: {exc}")
+                return self._escalate(trace, iteration, reason=f"llm_error: {exc}", metrics=metrics)
 
             if response.function_calls:
                 contents.append(self._as_content(response.raw_content, response.function_calls))
                 response_parts: List[types.Part] = []
                 actions: List[Dict[str, Any]] = []
                 observations: List[Dict[str, Any]] = []
-                for call in response.function_calls:
-                    output = dispatch(call.name, call.args)
+                calls = response.function_calls
+                started = time.perf_counter()
+                can_parallelize = CONFIG.enabled and CONFIG.parallel_tools and len(calls) > 1 and all(c.name in {"lookup_order", "check_inventory"} for c in calls)
+                if can_parallelize:
+                    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+                        outputs = list(pool.map(lambda c: dispatch(c.name, c.args, metrics), calls))
+                    metrics.parallel_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+                else:
+                    outputs = [dispatch(c.name, c.args, metrics) for c in calls]
+                    metrics.sequential_latency_ms = round((time.perf_counter() - started) * 1000, 2)
+                for call, output in zip(calls, outputs):
                     actions.append({"name": call.name, "args": call.args})
                     observations.append(output)
+                    metrics.tools_executed += 1
+                    metrics.tool_failures += output.get("status") == "error"
                     response_parts.append(
                         self._function_response_part(call.name, output)
                     )
@@ -129,15 +148,16 @@ class ResolutionAgent:
                 escalated=False,
                 iterations=iteration,
                 trace=trace,
+                metrics=metrics.snapshot(),
             )
 
-        return self._escalate(trace, self.max_iterations, reason="max_iterations_exceeded")
+        return self._escalate(trace, self.max_iterations, reason="max_iterations_exceeded", metrics=metrics)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _escalate(self, trace: List[Dict[str, Any]], iterations: int, reason: str) -> AgentResult:
+    def _escalate(self, trace: List[Dict[str, Any]], iterations: int, reason: str, metrics: Metrics | None = None) -> AgentResult:
         """Halt the loop and flag the session for a human."""
         logger.warning(
             "session_flag=escalation reason=%s model_calls=%d", reason, iterations
@@ -157,6 +177,7 @@ class ResolutionAgent:
             escalated=True,
             iterations=iterations,
             trace=trace,
+            metrics=metrics.snapshot() if metrics else {},
         )
 
     @staticmethod

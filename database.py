@@ -281,3 +281,10 @@ def list_notifications() -> List[Dict[str, Any]]:
 def reset_db() -> None:
     """Restore the exact seed state (used between demo scenarios and tests)."""
     _seed()
+    # The demo database has changed wholesale; cached read models are stale.
+    # Local import avoids coupling the persistence layer to optional optimizers.
+    try:
+        from optimization import CACHE
+        CACHE.clear()
+    except ImportError:  # pragma: no cover - standalone DB use
+        pass

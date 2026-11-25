@@ -1,14 +1,16 @@
 # Order Resolution Agent
 
-Autonomous ReAct agent (Gemini function calling) that checks orders and inventory, then exchanges or refunds with safe tool dispatch and guardrails.
+An autonomous, guardrailed customer-resolution agent built with Google Gemini function calling. It investigates an order, checks replacement stock, chooses a safe exchange or refund outcome, notifies the customer, and returns a concise resolution.
 
-The agent is an LLM tool-calling loop (ReAct style) using **Google Gemini**
-(new `google-genai` SDK, automatic function calling disabled). It
-investigates damaged/broken orders on its own and autonomously decides
-between a replacement exchange and a refund, then notifies the customer.
+The project runs fully offline with a deterministic `MockLLM`; Gemini is used automatically when `GEMINI_API_KEY` is configured.
 
-A deterministic rule-based `MockLLM` provides the same interface and the
-same tool-call sequence, so the whole demo and suite run **fully offline**.
+## Highlights
+
+- **Safe autonomous workflow** — lookup → inventory → exchange/refund → notification.
+- **Gemini manual function calling** — model turns and tool responses preserve the required protocol ordering.
+- **Strong guardrails** — whitelist-only tools, schema validation, retry handling, and iteration-based escalation.
+- **Production-minded optimization** — compact prompts, payload pruning, read caching, and parallel read-tool execution.
+- **Measurable behavior** — per-run metrics plus a reproducible offline benchmark.
 
 ## Quick start
 
@@ -17,190 +19,109 @@ git clone <your-repo-url>
 cd order-resolution-agent
 
 python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+# Windows
+venv\Scripts\activate
+# macOS / Linux: source venv/bin/activate
 
 pip install -r requirements.txt
-
-cp .env.example .env              # Windows: copy .env.example .env
-# then edit .env and paste your real GEMINI_API_KEY
-
-python main.py --demo             # 5 scenarios (Gemini if key present, else mock)
-python main.py --demo --mock      # force offline mock mode
-pytest -q                         # full offline test suite
+copy .env.example .env  # macOS / Linux: cp .env.example .env
 ```
 
-`GEMINI_API_KEY` is read from `.env` (loaded via python-dotenv); the model
-name defaults to `gemini-2.5-flash` (`GEMINI_MODEL`). Without a key the
-agent falls back to the offline `MockLLM` automatically.
+Add your key to `.env` only when you want live Gemini calls:
 
-## Security
-
-- `.env` holds your real API key and is excluded via `.gitignore`.
-- **Never commit `.env`** - verify with `git status` before pushing; it must
-  not appear, while `.env.example` (the safe template) stays in the repo.
-- Report issues without reproducing them on real orders: the mock DB is
-  synthetic.
-
-## Architecture
-
+```env
+GEMINI_API_KEY=your_key_here
 ```
-                      +-----------------------------+
-                      |           main.py           |
-                      |  CLI: --demo / interactive  |
-                      |  picks GeminiLLM or MockLLM |
-                      +-------------+---------------+
-                                    |
-                        user message (scenario / prompt)
-                                    v
-                      +-----------------------------+
-                      |          agent.py           |
-                      |   ResolutionAgent.run()     |
-                      |  ReAct loop + guardrails    |
-                      |                             |
-                      |  contents history:          |
-                      |   user -> model(Fc) ->      |
-                      |   user(FR) -> model -> ...  |
-                      +------+---------------+------+
-                             |               |
-              generate()     |               |  dispatch()
-              (Thought)      v               v  (Action/Observation)
-        +-------------+            +---------------------+
-        |   llm.py    |            |     registry.py     |
-        | GeminiLLM   |            | TOOL_REGISTRY       |
-        | MockLLM     |            | whitelist + safe    |
-        | (same       |            | dispatcher:         |
-        |  interface) |            | UNAUTHORIZED_TOOL / |
-        +------+------+            | INVALID_ARGUMENTS / |
-               |                   | TOOL_EXECUTION_ERROR|
-               | model calls       +----------+----------+
-               v                              |
-     +--------------------+        schemas.py | build_gemini_tools()
-     |    Google Gemini    |        (dict schemas = single source of truth,
-     | gemini-2.5-flash    |         also converted to types.FunctionDeclaration)
-     | function calling    |
-     | AFC disabled        |
-     +--------------------+                   |
-                                  +----------------------+
-                                  |       tools.py       |
-                                  | lookup_order         |
-                                  | check_inventory      |
-                                  | process_refund       |
-                                  | confirm_exchange     |
-                                  | send_notification    |
-                                  +----------+-----------+
-                                             |
-                                  +----------+-----------+
-                                  |      database.py     |
-                                  | in-memory orders /   |
-                                  | inventory / refunds /|
-                                  | exchanges / notes    |
-                                  +----------------------+
-```
-
-## Run modes
 
 ```bash
-python main.py                    # interactive prompt
-python main.py --mock             # force offline mock
-python main.py --max-iterations 3 # custom guardrail
+python main.py --demo --mock  # offline demo
+python main.py --demo         # Gemini when a key is available; mock otherwise
+python main.py                # interactive session
+python -m pytest -q           # offline test suite
+python benchmark.py           # optimization benchmark
 ```
 
-Demo scenarios: (1) damaged item in stock -> exchange, (2) damaged item,
-stock 0 -> refund, (3) final-sale order -> refund, (4) unknown order ->
-graceful not-found, no refund, (5) runaway model loop -> iteration cap ->
-human escalation.
-
-## Steps 1-5 mapped to files
-
-| Step | Requirement | File |
-|------|-------------|------|
-| 1 | 5 deterministic tools that return status dicts and never raise | `tools.py`, seed data in `database.py` |
-| 2 | One declarative schema per tool + `build_gemini_tools()` for `types.FunctionDeclaration` | `schemas.py` |
-| 3 | Whitelist registry and safe dispatcher (unauthorized tools, arg validation, execution-error wrapping) | `registry.py` |
-| 4 | ReAct loop, manual function calling, full-turn history append (thought signatures preserved), provider-agnostic `LLMResponse` interface | `agent.py`, `llm.py` |
-| 5 | `MAX_ITERATIONS` + escalation, tool-error feedback, malformed-arg self-correction, 429/503 retry (1s, 3s) then escalate | `agent.py`, `llm.py`, `main.py` |
-
-## Example output (`python main.py --demo --mock`, abridged)
-
-```
-# Scenario 1/5: Damaged item, replacement in stock -> exchange
-
-User: Hi, my order ORD-1001 arrived with a cracked screen on the laptop. It's damaged, what can you do?
-
---- Iteration 1 --------------------------------------------------
-[Thought]   I need the details of ORD-1001 before acting.
-[Action]      lookup_order(order_id='ORD-1001')
-[Observation] {'status': 'success', 'order_id': 'ORD-1001', 'customer_name': 'Ana Silva', ...}
-
---- Iteration 2 --------------------------------------------------
-[Action]      check_inventory(item_id='ITEM-LAPTOP-15')
-[Observation] {'status': 'success', 'item_id': 'ITEM-LAPTOP-15', 'stock_count': 4, 'available': True}
-
---- Iteration 3 --------------------------------------------------
-[Action]      confirm_exchange(order_id='ORD-1001')
-[Observation] {'status': 'success', 'order_id': 'ORD-1001', 'exchange_reference': 'EXG-09C2D4', 'remaining_stock': 3}
-
---- Iteration 4 --------------------------------------------------
-[Action]      send_notification(customer_email='ana.silva@example.com', message='Dear Ana Silva, ...')
-[Observation] {'status': 'success', 'notification_id': 'NTF-1B7E52', 'delivered': True}
-
---- Iteration 5 --------------------------------------------------
-[Response]  Hi Ana Silva! Your exchange for order ORD-1001 is confirmed under
-reference EXG-09C2D4 (remaining stock: 3). A confirmation email has been sent
-to ana.silva@example.com. Anything else I can help with?
-
-Final answer : Hi Ana Silva! Your exchange for order ORD-1001 is confirmed ...
-Escalated    : False
-Model calls  : 5
-Tools called : lookup_order -> check_inventory -> confirm_exchange -> send_notification
-DB side effects:
-  refund(s): REF-LEGACY42
-  exchange(s): EXG-09C2D4
-  notification(s): NTF-1B7E52 -> ana.silva@example.com
-```
-
-## Design notes
-
-## AI optimization
-
-The agent keeps its existing Gemini/manual-tool architecture while adding four
-measured optimizations: compact instructions and declarations, schema-aware
-payload pruning, ordered parallel execution of independent read-only calls,
-and a bounded 120-second process-local TTL cache. Mutating tools are never
-cached or parallelized. Cache keys include the operation and validated args;
-multi-tenant integrations should also pass a tenant identifier. The in-memory
-cache is per process, so use Redis for multi-instance deployments.
+## Resolution workflow
 
 ```mermaid
 flowchart LR
-  U[User] --> A[ResolutionAgent]
-  A --> P[Prune/compact request]
-  P --> G[Gemini]
-  G --> E[Safe tool executor]
-  E --> C[TTL cache: reads]
-  E --> D[DB tools]
-  E --> M[Measured metrics]
+    U[Customer request] --> A[ResolutionAgent]
+    A --> G[Gemini or MockLLM]
+    G --> R[Validated tool registry]
+    R --> C{Read tool?}
+    C -->|yes| T[120-second TTL cache]
+    T --> D[In-memory order data]
+    C -->|no| D
+    D --> R --> G --> O[Resolution + metrics]
 ```
 
-Configure `.env` with `AI_OPTIMIZATION_ENABLED`, `PROMPT_COMPACTION_ENABLED`,
-`PAYLOAD_PRUNING_ENABLED`, `PARALLEL_TOOL_CALLING`, `CACHE_TTL_SECONDS` (120),
-`CACHE_MAX_ENTRIES`, `MAX_HISTORY_MESSAGES`, and `TOOL_TIMEOUT_MS`.
+| Step | Tool | Outcome |
+|---|---|---|
+| 1 | `lookup_order` | Finds the order and eligibility facts. |
+| 2 | `check_inventory` | Determines whether a replacement exists. |
+| 3 | `confirm_exchange` or `process_refund` | Performs the appropriate, mutually exclusive resolution. |
+| 4 | `send_notification` | Sends one confirmation after a successful resolution. |
 
-Run the reproducible offline benchmark with `python benchmark.py`; its tool
-latency is explicitly simulated, while cache counts and payload sizes are
-actual process measurements. Gemini token/output usage appears only when the
-provider returns usage metadata; unavailable values remain `N/A`.
+If an order is missing, the agent asks the customer to verify it. If the model loops or the service stays unavailable, the session is escalated rather than continuing indefinitely.
 
-- **Tools are the only mutation point** for the mock DB; every tool returns
-  `{"status": "success"|"error", ...}` and never raises, so the loop always
-  has an observation to feed back.
-- **Schemas are defined once** as plain dicts and shared by the Gemini tool
-  declarations and the dispatcher's argument validation - no drift.
-- **Gemini history discipline**: the full model turn (candidate content,
-  thought signatures included) is appended unchanged; all function calls are
-  executed and answered with a single user-role content whose parts are in
-  the same order as the calls (linked by name since Gemini supplies no IDs).
-- **Guardrails**: `MAX_ITERATIONS` (counts model calls; happy path = 5, cap
-  default 6) triggers `escalated=True` with "Flagged for human escalation"
-  logged via `logging`; LLM 429/5xx failures are retried twice (1s, 3s) and
-  then escalated - the loop never crashes.
+## AI optimization
+
+| Technique | Implementation | Safety boundary |
+|---|---|---|
+| Prompt and schema compaction | Concise system guidance and tool declarations. | Required arguments and validation remain unchanged. |
+| Payload pruning | Removes safe empty/noise fields and limits oversized text while preserving `false`, `0`, protocol fields, and meaningful results. | Never removes required Gemini function-call metadata. |
+| Parallel tools | Uses ordered parallel execution only for a batch of independent read-only calls. | Refunds, exchanges, and notifications always stay sequential. |
+| In-memory cache | Bounded, single-flight TTL cache for order and inventory reads. | Writes, failed calls, credentials, and shared sensitive values are never cached. |
+
+### Metrics
+
+Every `AgentResult` exposes `metrics`; demo and interactive modes print them as JSON. Available measurements include request payload bytes, Gemini usage metadata, cache hits/misses, cache latency, tool counts/errors, parallel/sequential timings, API-call count, and end-to-end latency.
+
+Provider token values are populated only when Gemini returns usage metadata; unavailable values are intentionally reported as `null` / N/A rather than estimated. `benchmark.py` uses a clearly labelled 40 ms controlled delay to compare sequential and parallel read execution; cache data is measured from the real process cache.
+
+## Configuration
+
+Copy [.env.example](.env.example) and adjust as needed.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model used for live requests. |
+| `AI_OPTIMIZATION_ENABLED` | `true` | Master optimization switch. |
+| `PROMPT_COMPACTION_ENABLED` | `true` | Enables compact prompt behavior. |
+| `PAYLOAD_PRUNING_ENABLED` | `true` | Enables outbound payload pruning. |
+| `PARALLEL_TOOL_CALLING` | `true` | Allows eligible read batches to run concurrently. |
+| `CACHE_TTL_SECONDS` | `120` | Lifetime of cached read results. |
+| `CACHE_MAX_ENTRIES` | `500` | Maximum process-local cache entries. |
+| `MAX_HISTORY_MESSAGES` | `6` | Conversation-context budget. |
+| `TOOL_TIMEOUT_MS` | `10000` | Reserved timeout setting for external tool integrations. |
+
+## Project layout
+
+```text
+agent.py          ReAct loop, metrics, and parallel-call coordination
+llm.py            Gemini and offline LLM adapters
+schemas.py        Shared Gemini declarations and argument schemas
+registry.py       Whitelist dispatch, validation, and read-cache integration
+optimization.py   Configuration, pruning, TTL cache, and metrics
+tools.py          Resolution tool implementations
+database.py       Synthetic in-memory data store
+benchmark.py      Reproducible optimization benchmark
+tests/            Offline behavioral tests
+```
+
+## Quality checks
+
+```bash
+python -m pytest -q
+python -m compileall -q .
+python benchmark.py
+```
+
+The tests cover core resolution behavior, safe dispatch, invalid arguments, tool failures, refund/exchange constraints, notification flow, and escalation behavior. See [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) for implementation detail and measured benchmark guidance.
+
+## Security and production notes
+
+- Keep `GEMINI_API_KEY` in `.env`; never commit it.
+- The included database is synthetic and intended only for local demonstration.
+- The default cache is process-local. Replace it with Redis or another shared store for multiple application instances.
+- Model-triggered writes remain intentionally serialized. Extend tools with authorization and audit controls before using real financial or customer systems.
